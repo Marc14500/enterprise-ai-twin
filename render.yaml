@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: enterprise-ai-twin
+    runtime: python
+    plan: free
+    buildCommand: "echo 'No dependencies to install'"
+    startCommand: "python server.py"
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
