@@ -11,7 +11,7 @@ MAX_RUNS_PER_IP_PER_DAY=3
 CASES=[{'id':'finance','department':'Finance','request':'Automate a weekly financial variance report using approved internal read-only financial data.','risk':1,'data':'internal','write':False,'hours':6}, {'id':'hr','department':'HR','request':'Build an assistant to answer employees questions about approved HR policies without accessing employee records.','risk':1,'data':'internal','write':False,'hours':4}, {'id':'sales','department':'Sales','request':'Deploy an agent that automatically changes customer discounts in the CRM.','risk':3,'data':'confidential','write':True,'hours':12}, {'id':'ops','department':'Operations','request':'Summarize supplier delays from an approved read-only logistics dashboard.','risk':1,'data':'internal','write':False,'hours':5}, {'id':'procurement','department':'Procurement','request':'Build a contract review assistant that analyzes confidential supplier agreements.','risk':2,'data':'confidential','write':False,'hours':8}]
 ROLES=[('Business Manager','You manage a department. Describe business outcome, constraints, and urgency. Do not assume approval.'),('AI Champion','You are a qualified local AI champion. Propose a limited implementation plan, permitted tools and a test plan. You cannot grant yourself authority.'),('Governance Officer','You are an independent governance officer. Challenge the plan, identify security, privacy, and compliance risks and recommend controls. You cannot override policy.'),('Enterprise Architect','You are an enterprise architect. Assess architecture, integration, duplication and production readiness.'),('Executive Sponsor','You are an executive sponsor. Recommend whether to fund, pilot, defer or reject based on benefit, risk and capacity.')]
 def llm(role, instruction, context):
-    payload={'model':MODEL,'messages':[{'role':'system','content':instruction+' Return concise practical analysis (max 110 words). Do not claim that a simulation is real.'},{'role':'user','content':json.dumps(context)}],'temperature':0.35,'max_tokens':200}
+    payload={'model':MODEL,'messages':[{'role':'system','content':instruction+' Return concise practical analysis (max 180 words). Do not claim that a simulation is real.'},{'role':'user','content':json.dumps(context)}],'temperature':0.35,'max_tokens':350}
     req=urllib.request.Request(API_URL,data=json.dumps(payload).encode(),headers={'Authorization':'Bearer '+KEY,'Content-Type':'application/json'})
     try:
         with urllib.request.urlopen(req,timeout=45) as r: response=json.load(r)
@@ -22,36 +22,192 @@ def policy(case,model):
     if model=='mission' and case['risk']==1 and not case['write'] and case['data']=='internal':return {'decision':'DELEGATED PILOT','authority':'Qualified champion, bounded Tier 1 grant','enforced':'Read-only, approved internal data, logging, expiry, human review'}
     if case['risk']==3 or case['write']:return {'decision':'ESCALATE / NO AUTONOMOUS EXECUTION','authority':'Central governance and system owner required','enforced':'No production write access; security and business approvals required'}
     return {'decision':'CENTRAL REVIEW','authority':'Central AI and governance queue','enforced':'Data classification, review, test and audit trail'}
-def simulate(case,model):
-    record={'id':str(uuid.uuid4()),'case':case,'model':model,'policy':policy(case,model),'steps':[],'model_used':MODEL}
-    for role,instruction in ROLES:
-        context={'case':case,'operating_model':model,'binding_policy':record['policy'],'prior_agents':record['steps']}
-        response=llm(role,instruction,context)
-        record['steps'].append({'role':role,'response':response})
-    record['note']='AI role assessments are generated. Authorization is deterministic and cannot be changed by the agents. Synthetic scenario only.'
-    return record
+
+
+import threading,hashlib,random
+from collections import defaultdict
+from datetime import datetime,timezone
+from urllib.parse import urlsplit
+LOCK=threading.RLock()
+SESSIONS={}
+RUN_COUNTS=defaultdict(int)
+MAX_SESSIONS_PER_IP_DAY=int(os.getenv('MAX_SESSIONS_PER_IP_DAY','3'))
+MAX_STEPS=12
+ROSTER={
+ 'Business Manager':'Owns the business outcome and measurable requirements',
+ 'AI Champion':'Designs limited AI pilots under delegated authority',
+ 'Governance Officer':'Identifies control gaps and escalations, but cannot change binding rules',
+ 'Enterprise Architect':'Designs technical integration and test requirements',
+ 'Executive Sponsor':'Controls simulated funding and investment priorities',
+ 'Engineering Agent':'Executes only simulated tests when policy permits',
+ 'Security Officer':'Challenges data security and access scope',
+ 'Portfolio Manager':'Evaluates repeatable demand and potential enterprise promotion'
+}
+PLAYBOOK=[
+ ('Business Manager','Initiate the request, quantify opportunity and address the AI Champion.'),
+ ('AI Champion','Reply to the manager with a scoped proposal and ask the Governance Officer for controls.'),
+ ('Governance Officer','Respond to the Champion and ask the Architect to confirm technical safeguards.'),
+ ('Enterprise Architect','Respond to governance, propose concrete sandbox architecture and tests.'),
+ ('Security Officer','Challenge the Architect on access and threat boundaries.'),
+ ('AI Champion','Answer the concerns raised by Security and ask for binding policy authorization.'),
+ ('Executive Sponsor','Respond to the Champion, discuss resources and approve or decline simulated budget subject to policy.'),
+ ('Engineering Agent','Report a SIMULATED technical test if permitted, otherwise explain the policy block.'),
+ ('Business Manager','Respond to the Engineering Agent; evaluate the result and request refinements.'),
+ ('AI Champion','Respond to Business Manager and explain whether the prototype is ready for further validation.'),
+ ('Portfolio Manager','Consider reuse across departments; recommend promotion or continued pilot with reasons.'),
+ ('Executive Sponsor','Conclude with a clear decision, remaining risks and next actions.')
+]
+def utc_day():return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+def sanitized(s,n=500):return str(s or '')[:n]
+def public_session(s):return {k:v for k,v in s.items() if not k.startswith('_')}
+def policy_for(s):
+    c=s['case'];m=s['model'];i=s['interventions']
+    if i['freeze']:
+        return {'decision':'STOP / AUTHORITY REVOKED','authority':'Executive emergency stop','enforced':'No further simulated execution or spending until restored','permitted':False}
+    if c['risk']==3 or c['write']:
+        return {'decision':'ESCALATE / NO AUTONOMOUS EXECUTION','authority':'Central governance and system owner','enforced':'Production writes prohibited; security and business approval required','permitted':False}
+    if i['data_restricted']:
+        return {'decision':'HOLD / DATA ACCESS RESTRICTED','authority':'Data owner and governance approval','enforced':'Data access blocked pending reclassification','permitted':False}
+    if m=='mission' and c['risk']==1 and c['data']=='internal':
+        return {'decision':'DELEGATED PILOT','authority':'Qualified champion; scoped Tier 1 grant','enforced':'Approved read-only data, human review, logging and expiry','permitted':True}
+    return {'decision':'CENTRAL REVIEW','authority':'Central governance queue','enforced':'No autonomous pilot until central authorization','permitted':False}
+def new_session(case,model,ip):
+    sid=str(uuid.uuid4());seed=int(hashlib.sha256((case['id']+'|'+model).encode()).hexdigest()[:8],16)
+    s={'id':sid,'company':'GlobalCo Industries','case':case,'model':model,'day':1,'turn':0,'messages':[],
+       'events':[],'decisions':[],'interventions':{'freeze':False,'data_restricted':False,'budget_cap':1500},
+       'state':{'status':'new request','pilot':False,'budget_committed':0,'simulated_tests':0,'simulated_hours_saved':0,'work_items':0},
+       'policy':{},'seed':seed,'finished':False,'_ip':ip,'_busy':False}
+    s['policy']=policy_for(s)
+    with LOCK:SESSIONS[sid]=s
+    return s
+def record(s,kind,detail):s['events'].append({'day':s['day'],'kind':kind,'detail':detail})
+def intervene(s,action,value=None):
+    if action=='freeze':s['interventions']['freeze']=True
+    elif action=='unfreeze':s['interventions']['freeze']=False
+    elif action=='restrict_data':s['interventions']['data_restricted']=True
+    elif action=='restore_data':s['interventions']['data_restricted']=False
+    elif action=='budget':
+        try:v=int(value)
+        except (ValueError,TypeError):raise ValueError('Budget must be a whole number')
+        if not 0<=v<=10000:raise ValueError('Budget must be between 0 and 10000')
+        s['interventions']['budget_cap']=v
+    else:raise ValueError('Unknown intervention')
+    s['policy']=policy_for(s)
+    if not s['policy']['permitted']:
+        s['state']['pilot']=False
+        s['state']['status']='blocked by policy'
+    record(s,'CEO intervention',f'{action}'+(f' = {value}' if action=='budget' else ''))
+def perform_step(s):
+    t=s['turn']
+    if t>=len(PLAYBOOK):s['finished']=True;return
+    role,task=PLAYBOOK[t]
+    # The policy engine, not model output, controls all simulated state transitions.
+    s['policy']=policy_for(s)
+    p=s['policy']
+    if t==5:
+        s['decisions'].append({'day':s['day'],**p})
+        s['state']['pilot']=p['permitted']
+        s['state']['status']='delegated pilot authorized' if p['permitted'] else 'waiting for governance approval'
+        record(s,'Policy gate',p['decision'])
+    if t==6:
+        amount=min(600,s['interventions']['budget_cap']) if p['permitted'] else 0
+        s['state']['budget_committed']=amount
+        record(s,'Budget',f'Synthetic pilot allocation ${amount}')
+    if t==7:
+        if p['permitted'] and s['state']['budget_committed']>0:
+            # deterministic illustrative outputs, not measurements
+            s['state']['simulated_tests']=3
+            s['state']['simulated_hours_saved']=round(s['case']['hours']*0.6,1)
+            s['state']['status']='synthetic tests complete'
+            record(s,'Simulated test','3 illustrative test checks; not empirical validation')
+        else:
+            s['state']['status']='execution blocked'
+            record(s,'Execution blocked',p['decision'])
+    if t==10 and p['permitted']:
+        s['state']['work_items']=1
+        record(s,'Portfolio review','Potential reuse identified for evaluation, not promoted automatically')
+    if t==11:s['state']['status']='completed with pilot' if s['state']['simulated_tests'] else 'completed without execution'
+    context={'synthetic_company':s['company'],'business_request':s['case'],'operating_model':s['model'],
+             'your_role':role,'role_mandate':ROSTER[role],'task':task,'binding_policy':p,
+             'interventions':s['interventions'],'enterprise_state':s['state'],
+             'previous_agent_messages':s['messages'][-4:],'simulated_day':s['day'],
+             'instruction':'Respond to a specific preceding agent. Do not pretend synthetic tests are real measurements.'}
+    prompt=('You are an AI role agent in a synthetic enterprise digital twin. Generate a meaningful, concrete workplace message that responds to a named previous role when possible. '
+            'Be substantive and realistic. You can recommend actions but cannot override the binding policy or claim external actions were performed. '
+            'For tests, clearly label outcomes illustrative. Respond with ONLY a valid JSON object, no markdown fences, with these exact keys: '
+            '"to" (recipient role), "message" (3-5 concise sentences, max 500 characters), '
+            '"rationale" (1-2 sentence public decision justification citing specific assumptions/evidence, NOT hidden reasoning), '
+            '"risk" (specific risk or uncertainty), "proposed_action" (short). '
+            'Do not expose private chain-of-thought. If blocked by policy, explicitly say so.')
+    raw=llm(role,prompt,context)
+    try:
+        import re
+        match=re.search(r'\{.*\}',raw,re.S)
+        item=json.loads(match.group(0) if match else raw)
+        if not isinstance(item,dict):raise ValueError('Expected JSON object')
+    except Exception:
+        item={'to':'Enterprise Team','message':raw[:500],'rationale':'Unstructured model response; verify manually.','risk':'Response parsing failed.','proposed_action':'Review'}
+    msg={'day':s['day'],'from':role,'to':sanitized(item.get('to','Enterprise Team'),70),
+         'message':sanitized(item.get('message'),650),'rationale':sanitized(item.get('rationale'),400),
+         'risk':sanitized(item.get('risk'),300),'proposed_action':sanitized(item.get('proposed_action'),100)}
+    s['messages'].append(msg);s['turn']+=1
+    if t in (2,5,7,10):s['day']+=1
+    if s['turn']>=len(PLAYBOOK):s['finished']=True
+    return s
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self,*args,**kwargs):super().__init__(*args,directory=str(ROOT),**kwargs)
     def sendjson(self,code,obj):
-        raw=json.dumps(obj).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(raw)
+        data=json.dumps(obj).encode();self.send_response(code)
+        self.send_header('Content-Type','application/json; charset=utf-8')
+        self.send_header('Content-Length',str(len(data)))
+        self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff')
+        self.end_headers();self.wfile.write(data)
     def do_GET(self):
-        if self.path=='/api/status':return self.sendjson(200,{'connected':bool(KEY),'model':MODEL,'provider':PROVIDER,'agents':len(ROLES),'cases':CASES})
+        if urlsplit(self.path).path=='/api/status':
+            return self.sendjson(200,{'connected':bool(KEY),'model':MODEL,'provider':PROVIDER,
+              'cases':CASES,'max_sessions_per_day':MAX_SESSIONS_PER_IP_DAY,'version':'0.5'})
         return super().do_GET()
     def do_POST(self):
-        if self.path!='/api/run':return self.sendjson(404,{'error':'Unknown endpoint'})
+        path=urlsplit(self.path).path
+        if path not in ('/api/session','/api/step','/api/intervene'):return self.sendjson(404,{'error':'Unknown endpoint'})
         try:
             n=int(self.headers.get('Content-Length','0'))
-            if n>10000: return self.sendjson(413,{'error':'Request too large'})
-            body=json.loads(self.rfile.read(n));case=next((x for x in CASES if x['id']==body.get('case')),None);model=body.get('model')
-            if not case or model not in ('mission','central'):return self.sendjson(400,{'error':'Choose a valid case and model'})
-            if not KEY:return self.sendjson(503,{'error':'An AI provider API key is not configured. Real agents are unavailable.'})
+            if not 0<n<=5000:return self.sendjson(400,{'error':'Invalid request size'})
+            body=json.loads(self.rfile.read(n))
+            if not KEY:return self.sendjson(503,{'error':'Gemini API key missing on Render'})
             ip=self.client_address[0]
-            today=time.strftime('%Y-%m-%d',time.gmtime())
-            counter_key=(ip,today)
-            if RUN_COUNTS.get(counter_key,0)>=MAX_RUNS_PER_IP_PER_DAY:
-                return self.sendjson(429,{'error':'Daily demo limit reached for this visitor. Try again tomorrow.'})
-            RUN_COUNTS[counter_key]=RUN_COUNTS.get(counter_key,0)+1
-            return self.sendjson(200,simulate(case,model))
-        except Exception as e:return self.sendjson(502,{'error':str(e)[:350]})
+            # Optional access passcode protects API quota for public services.
+            access=os.getenv('SIM_ACCESS_CODE','')
+            if access and body.get('access_code')!=access:return self.sendjson(403,{'error':'Incorrect simulation access code'})
+            if path=='/api/session':
+                case=next((c for c in CASES if c['id']==body.get('case')),None)
+                model=body.get('model')
+                if not case or model not in ('mission','central'):return self.sendjson(400,{'error':'Invalid scenario or model'})
+                with LOCK:
+                    key=(ip,utc_day())
+                    if RUN_COUNTS[key]>=MAX_SESSIONS_PER_IP_DAY:return self.sendjson(429,{'error':'Daily simulation limit reached for this connection'})
+                    RUN_COUNTS[key]+=1
+                    if len(SESSIONS)>=120:SESSIONS.pop(next(iter(SESSIONS)))
+                    s=new_session(case,model,ip)
+                return self.sendjson(200,public_session(s))
+            sid=body.get('id')
+            with LOCK:
+                s=SESSIONS.get(sid)
+                if not s:return self.sendjson(404,{'error':'Simulation expired; start again'})
+                if s['_ip']!=ip:return self.sendjson(403,{'error':'Simulation session belongs to a different connection'})
+                if s['_busy']:return self.sendjson(409,{'error':'Agent already running'})
+                s['_busy']=True
+            try:
+                if path=='/api/intervene':intervene(s,body.get('action'),body.get('value'))
+                else:perform_step(s)
+                return self.sendjson(200,public_session(s))
+            finally:
+                with LOCK:s['_busy']=False
+        except ValueError as e:return self.sendjson(400,{'error':str(e)[:200]})
+        except Exception as e:
+            print('API error',type(e).__name__,str(e)[:250],flush=True)
+            return self.sendjson(502,{'error':str(e)[:250]})
 if __name__=='__main__':
-    port=int(os.getenv('PORT','8000'));print(f'Agent server http://localhost:{port} | model={MODEL} | API key configured={bool(KEY)}',flush=True);ThreadingHTTPServer(('0.0.0.0',port),Handler).serve_forever()
+    port=int(os.getenv('PORT','8000'))
+    print('Enterprise Twin v0.5 on',port,flush=True)
+    ThreadingHTTPServer(('0.0.0.0',port),Handler).serve_forever()
