@@ -33,6 +33,7 @@ SESSIONS={}
 RUN_COUNTS=defaultdict(int)
 MAX_SESSIONS_PER_IP_DAY=int(os.getenv('MAX_SESSIONS_PER_IP_DAY','3'))
 MAX_STEPS=12
+APP_VERSION='0.6'
 ROSTER={
  'Business Manager':'Owns the business outcome and measurable requirements',
  'AI Champion':'Designs limited AI pilots under delegated authority',
@@ -97,6 +98,63 @@ def intervene(s,action,value=None):
         s['state']['pilot']=False
         s['state']['status']='blocked by policy'
     record(s,'CEO intervention',f'{action}'+(f' = {value}' if action=='budget' else ''))
+def parse_agent_response(raw):
+    """Recover structured Gemini replies, including double-encoded JSON."""
+    import re
+    candidate=raw.strip()
+    for _ in range(3):
+        if candidate.startswith('```'):
+            candidate=re.sub(r'^```(?:json)?\\s*|\\s*```$', '', candidate).strip()
+        try:
+            obj=json.loads(candidate)
+            if isinstance(obj,str):
+                candidate=obj.strip()
+                continue
+            if isinstance(obj,dict):
+                return obj
+        except (ValueError,TypeError):
+            pass
+        match=re.search(r'\\{.*\\}',candidate,re.S)
+        if match and match.group(0)!=candidate:
+            candidate=match.group(0)
+            continue
+        break
+    return {'to':'Enterprise Team','message':raw[:500],
+            'rationale':'The agent response could not be parsed reliably.',
+            'risk':'Response formatting requires review.','proposed_action':'Review'}
+
+def readable_field(value,limit):
+    if isinstance(value,(dict,list)):
+        value=json.dumps(value,ensure_ascii=False)
+    text=str(value or '').strip()
+    # Some model replies place JSON in the message field itself.
+    if text.startswith('{'):
+        try:
+            nested=json.loads(text)
+            if isinstance(nested,dict) and 'message' in nested:
+                text=str(nested['message'])
+        except ValueError:
+            pass
+    return text[:limit]
+
+def explain_event(s,t):
+    explanations=[
+      'The business identifies an opportunity. This creates demand for an AI solution.',
+      'A qualified employee proposes a limited pilot instead of a full enterprise deployment.',
+      'Governance challenges the proposal before any implementation is permitted.',
+      'Architecture examines integration, data boundaries and duplication.',
+      'Security checks the permissions and exposure the pilot would require.',
+      'A binding policy decision determines whether delegated work may proceed.',
+      'Funding can only be allocated within the permitted authority and CEO budget.',
+      'The simulated test either proceeds under approved controls or is blocked.',
+      'The business evaluates the synthetic result rather than accepting a technical success alone.',
+      'The champion identifies what must be validated before real deployment.',
+      'Portfolio review considers whether the same solution might be useful elsewhere.',
+      'Leadership closes the request with a decision and unresolved risks.'
+    ]
+    outcome='Blocked by binding policy.' if t in (5,7) and not s['policy']['permitted'] else ''
+    return explanations[t]+' '+outcome
+
 def perform_step(s):
     t=s['turn']
     if t>=len(PLAYBOOK):s['finished']=True;return
@@ -140,16 +198,13 @@ def perform_step(s):
             '"risk" (specific risk or uncertainty), "proposed_action" (short). '
             'Do not expose private chain-of-thought. If blocked by policy, explicitly say so.')
     raw=llm(role,prompt,context)
-    try:
-        import re
-        match=re.search(r'\{.*\}',raw,re.S)
-        item=json.loads(match.group(0) if match else raw)
-        if not isinstance(item,dict):raise ValueError('Expected JSON object')
-    except Exception:
-        item={'to':'Enterprise Team','message':raw[:500],'rationale':'Unstructured model response; verify manually.','risk':'Response parsing failed.','proposed_action':'Review'}
-    msg={'day':s['day'],'from':role,'to':sanitized(item.get('to','Enterprise Team'),70),
-         'message':sanitized(item.get('message'),650),'rationale':sanitized(item.get('rationale'),400),
-         'risk':sanitized(item.get('risk'),300),'proposed_action':sanitized(item.get('proposed_action'),100)}
+    item=parse_agent_response(raw)
+    msg={'day':s['day'],'from':role,'to':readable_field(item.get('to','Enterprise Team'),70),
+         'message':readable_field(item.get('message'),650),
+         'rationale':readable_field(item.get('rationale'),400),
+         'risk':readable_field(item.get('risk'),300),
+         'proposed_action':readable_field(item.get('proposed_action'),100),
+         'narration':explain_event(s,t)}
     s['messages'].append(msg);s['turn']+=1
     if t in (2,5,7,10):s['day']+=1
     if s['turn']>=len(PLAYBOOK):s['finished']=True
@@ -165,7 +220,7 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if urlsplit(self.path).path=='/api/status':
             return self.sendjson(200,{'connected':bool(KEY),'model':MODEL,'provider':PROVIDER,
-              'cases':CASES,'max_sessions_per_day':MAX_SESSIONS_PER_IP_DAY,'version':'0.5'})
+              'cases':CASES,'max_sessions_per_day':MAX_SESSIONS_PER_IP_DAY,'version':APP_VERSION})
         return super().do_GET()
     def do_POST(self):
         path=urlsplit(self.path).path
@@ -209,5 +264,5 @@ class Handler(SimpleHTTPRequestHandler):
             return self.sendjson(502,{'error':str(e)[:250]})
 if __name__=='__main__':
     port=int(os.getenv('PORT','8000'))
-    print('Enterprise Twin v0.5 on',port,flush=True)
+    print('Enterprise Twin v0.6 on',port,flush=True)
     ThreadingHTTPServer(('0.0.0.0',port),Handler).serve_forever()
